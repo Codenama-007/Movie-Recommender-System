@@ -1,0 +1,5 @@
+venv/
+imdb_raw/
+model/
+.env
+imdb_movies_clean.csv
