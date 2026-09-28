@@ -1,27 +1,41 @@
 """
 app.py — Movie Recommender (Streamlit)
 
-Loads imdb_movies_clean.csv (produced by prepare_imdb_data.py), builds a
-TF-IDF representation of each title's text (title + genres), and returns
+Loads the precomputed model in ./model/ (built by build_model.py) and returns
 the closest matches to whatever the user types in (e.g. "sci-fi thriller").
 
+Each movie is scored by blending three signals:
+    1. TF-IDF cosine similarity   -> exact keyword / genre overlap
+    2. SVD latent-factor similarity -> semantically related movies that share
+                                       no exact words with the query
+    3. Baseline rating (mu + b_i)  -> a gentle quality prior, so a well-rated,
+                                       well-voted movie edges out an obscure
+                                       one when relevance is close
+
 Run:
-    pip install streamlit pandas scikit-learn
+    pip install streamlit pandas numpy scikit-learn joblib requests python-dotenv
     streamlit run app.py
 """
 
 import os
 import joblib
+import numpy as np
 import requests
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import normalize
 
 load_dotenv()  # reads .env in the working directory, if present
 
 MODEL_DIR = "model"
 PLACEHOLDER_POSTER = "https://placehold.co/300x445?text=No+Poster"
+
+# Blend weights used in recommend()
+TFIDF_WEIGHT = 0.7     # keyword/genre overlap (the original ranking signal)
+LATENT_WEIGHT = 0.3    # SVD latent-factor similarity
+QUALITY_WEIGHT = 0.3   # how strongly the baseline rating nudges the final score (0 = ignore)
 
 # Loaded from .env (OMDB_API_KEY=...). See build_model.py note / README.
 OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
@@ -55,42 +69,58 @@ def fetch_poster(tconst: str, api_key: str) -> str:
 
 @st.cache_resource
 def load_model():
-    vectorizer_path = os.path.join(MODEL_DIR, "vectorizer.joblib")
-    matrix_path = os.path.join(MODEL_DIR, "matrix.joblib")
-    movies_path = os.path.join(MODEL_DIR, "movies.joblib")
-
-    vectorizer = joblib.load(vectorizer_path)
-    matrix = joblib.load(matrix_path)
-    df = joblib.load(movies_path)
-    return df, vectorizer, matrix
+    vectorizer = joblib.load(os.path.join(MODEL_DIR, "vectorizer.joblib"))
+    matrix = joblib.load(os.path.join(MODEL_DIR, "matrix.joblib"))
+    df = joblib.load(os.path.join(MODEL_DIR, "movies.joblib"))
+    components = joblib.load(os.path.join(MODEL_DIR, "svd_components.joblib"))
+    latent = joblib.load(os.path.join(MODEL_DIR, "svd_latent.joblib"))
+    return df, vectorizer, matrix, components, latent
 
 
 def clean_query(text: str) -> str:
     return text.lower().strip()
 
 
-def recommend(query: str, df: pd.DataFrame, vectorizer, matrix,
+def recommend(query: str, df: pd.DataFrame, vectorizer, matrix, components, latent,
               top_n: int = 10, min_rating: float = 0.0):
     query_clean = clean_query(query)
     if not query_clean:
         return pd.DataFrame()
 
     query_vec = vectorizer.transform([query_clean])
-    sims = cosine_similarity(query_vec, matrix).flatten()
+    if query_vec.nnz == 0:
+        # None of the words appear in the vocabulary (e.g. "asdfgh")
+        return pd.DataFrame()
 
-    result = df.copy()
-    result["similarity"] = sims
-    result = result[result["similarity"] > 0]
-    result = result[result["rating"] >= min_rating]
+    # 1) Keyword / genre overlap: TF-IDF cosine similarity (original signal)
+    sim_tfidf = cosine_similarity(query_vec, matrix).ravel()
 
-    # Rank primarily by similarity, break ties with rating then votes
-    result = result.sort_values(
-        by=["similarity", "rating", "votes"],
-        ascending=[False, False, False],
-    )
+    # 2) Latent-factor similarity: project the query into the same SVD space
+    #    as the movies, then cosine similarity (rows are unit length, so a
+    #    dot product is enough). Negative values are clipped to 0.
+    q_latent = normalize(query_vec @ components.T)
+    sim_latent = np.clip(latent @ q_latent.ravel(), 0.0, None)
 
-    return result.head(top_n)[
-        ["tconst", "title", "genres", "rating", "votes", "year", "type", "similarity"]
+    relevance = TFIDF_WEIGHT * sim_tfidf + LATENT_WEIGHT * sim_latent
+
+    # 3) Baseline quality prior in [1 - QUALITY_WEIGHT, 1]. Multiplying (rather
+    #    than adding) means an irrelevant movie can never win on rating alone.
+    baseline = df["baseline"].to_numpy()
+    quality = (1 - QUALITY_WEIGHT) + QUALITY_WEIGHT * np.clip(baseline / 10.0, 0.0, 1.0)
+    score = relevance * quality
+
+    rating = df["rating"].to_numpy()
+    candidates = np.where((relevance > 0) & (rating >= min_rating))[0]
+    if candidates.size == 0:
+        return pd.DataFrame()
+
+    order = candidates[np.argsort(-score[candidates], kind="stable")][:top_n]
+
+    result = df.iloc[order].copy()
+    result["similarity"] = relevance[order]
+    result["score"] = score[order]
+    return result[
+        ["tconst", "title", "genres", "rating", "votes", "year", "type", "similarity", "score"]
     ]
 
 
@@ -103,7 +133,7 @@ st.title("🎬 Movie Recommender")
 st.caption("Type a mood, genre, or keywords (e.g. \"sci-fi thriller\", \"romantic comedy\") and get closest matches from IMDb data.")
 
 try:
-    df, vectorizer, matrix = load_model()
+    df, vectorizer, matrix, components, latent = load_model()
 except FileNotFoundError:
     st.error(
         f"Couldn't find model files in `./{MODEL_DIR}/`. Run "
@@ -128,7 +158,8 @@ with st.sidebar:
 query = st.text_input("What are you in the mood for?", placeholder="e.g. sci-fi thriller")
 
 if query:
-    results = recommend(query, df, vectorizer, matrix, top_n=top_n, min_rating=min_rating)
+    results = recommend(query, df, vectorizer, matrix, components, latent,
+                        top_n=top_n, min_rating=min_rating)
     if results.empty:
         st.warning("No matches found — try different or broader keywords, or lower the min rating.")
     else:
