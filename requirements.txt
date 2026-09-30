@@ -3,3 +3,4 @@ requests
 streamlit
 scikit-learn
 python-dotenv
+xgboost
