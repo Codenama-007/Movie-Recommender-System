@@ -47,6 +47,7 @@ Produces (./model_multi/):
 
 import os
 import json
+import time
 import datetime
 import numpy as np
 import pandas as pd
@@ -67,6 +68,14 @@ GENRE_WEIGHT = 3          # repeat genre tokens so they outweigh title words
 SVD_COMPONENTS = 100       # TF-IDF latent factors
 BASELINE_REG = 100         # damping ("virtual votes") for genre-bias baseline
 KNN_K = 20                 # neighbors for the item-based KNN model
+KNN_REFERENCE_SIZE = 20000  # cap on how many movies KNN searches against.
+                             # Brute-force cosine KNN costs O(n_query * n_reference).
+                             # At ~150k movies, querying against ALL of them (n_reference
+                             # = n_query = 150k) is ~2.25 trillion multiply-adds -- this is
+                             # what makes the script take hours. Capping the searchable
+                             # reference set doesn't meaningfully hurt quality (KNN just
+                             # needs a large enough representative pool of neighbors, not
+                             # literally every movie) but cuts the cost proportionally.
 RANDOM_STATE = 42
 
 MODEL_NAMES = [
@@ -135,24 +144,41 @@ def predict_baseline(mu: float, genre_bias: dict, genres_clean: pd.Series):
 # KNNBaseline (Item) — similarity-weighted average of nearest neighbors
 # ---------------------------------------------------------------------
 
-def fit_knn(train_latent: np.ndarray, k: int = KNN_K):
+def fit_knn(train_latent: np.ndarray, train_rating: np.ndarray, k: int = KNN_K,
+            reference_size: int = KNN_REFERENCE_SIZE):
+    """Fits on a capped, randomly-sampled reference set rather than the full
+    input, so query cost stays roughly constant instead of growing with the
+    size of the dataset. Returns (nn_index, reference_ratings)."""
+    if len(train_latent) > reference_size:
+        rng = np.random.default_rng(RANDOM_STATE)
+        ref_idx = rng.choice(len(train_latent), size=reference_size, replace=False)
+    else:
+        ref_idx = np.arange(len(train_latent))
+    ref_latent = train_latent[ref_idx]
+    ref_rating = train_rating[ref_idx]
     nn = NearestNeighbors(n_neighbors=k, metric="cosine", algorithm="brute", n_jobs=-1)
-    nn.fit(train_latent)
-    return nn
+    nn.fit(ref_latent)
+    return nn, ref_rating, ref_idx
 
 
-def predict_knn(nn: NearestNeighbors, train_rating: np.ndarray, query_latent: np.ndarray,
-                 k: int = KNN_K, self_offset: np.ndarray = None):
-    """self_offset: for production (query set == train set), fetch k+1
-    neighbors and zero out each row's match to itself so it isn't just
-    echoing its own rating."""
-    n_fetch = k + 1 if self_offset is not None else k
+def predict_knn(nn: NearestNeighbors, ref_rating: np.ndarray, query_latent: np.ndarray,
+                 k: int = KNN_K, ref_idx: np.ndarray = None, query_idx: np.ndarray = None):
+    """ref_idx: original-dataset indices of the (possibly subsampled) reference
+    points the NN index was fit on. query_idx: original-dataset indices of the
+    query rows. When both are given (the production self-query case, where a
+    movie may itself be part of the reference sample), fetch k+1 neighbors and
+    zero out any neighbor that IS the query movie itself, so a movie doesn't
+    just echo its own rating back."""
+    exclude_self = ref_idx is not None and query_idx is not None
+    n_fetch = k + 1 if exclude_self else k
+    n_fetch = min(n_fetch, len(ref_rating))
     dist, idx = nn.kneighbors(query_latent, n_neighbors=n_fetch)
     sims = np.clip(1 - dist, 1e-6, None)
-    if self_offset is not None:
-        mask = idx == self_offset.reshape(-1, 1)
+    if exclude_self:
+        neighbor_orig_idx = ref_idx[idx]
+        mask = neighbor_orig_idx == query_idx.reshape(-1, 1)
         sims = np.where(mask, 0.0, sims)
-    ratings = train_rating[idx]
+    ratings = ref_rating[idx]
     weight_sum = sims.sum(axis=1)
     weight_sum[weight_sum == 0] = 1e-6
     return (sims * ratings).sum(axis=1) / weight_sum
@@ -178,15 +204,18 @@ def main():
     n = len(df)
 
     # --- TF-IDF + SVD latent factors (unchanged from before) -----------
+    t0 = time.time()
     print(f"[fit] TF-IDF on {n:,} rows ...")
     vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=2)
     matrix = vectorizer.fit_transform(df["combined_text"])
+    print(f"      done in {time.time() - t0:.1f}s, vocab size {matrix.shape[1]:,}")
 
     n_components = min(SVD_COMPONENTS, matrix.shape[1] - 1)
+    t0 = time.time()
     print(f"[svd] fitting TruncatedSVD with {n_components} components ...")
     svd = TruncatedSVD(n_components=n_components, random_state=RANDOM_STATE)
     svd.fit(matrix)
-    print(f"      variance explained: {svd.explained_variance_ratio_.sum():.1%}")
+    print(f"      done in {time.time() - t0:.1f}s, variance explained: {svd.explained_variance_ratio_.sum():.1%}")
     latent = normalize(svd.transform(matrix)).astype(np.float32)
     components = svd.components_.astype(np.float32)
 
@@ -212,7 +241,7 @@ def main():
     base_preds_meta, base_preds_test, base_preds_full = {}, {}, {}
 
     # --- 1) BaselineOnly (genre bias, fit on train only) -----------------
-    print("[fit] BaselineOnly ...")
+    print("[fit] BaselineOnly ..."); t0 = time.time()
     mu, genre_bias = fit_baseline(train["genres"], train["rating"], train["votes"])
     base_preds_meta["BaselineOnly"] = predict_baseline(mu, genre_bias, meta["genres"])
     base_preds_test["BaselineOnly"] = predict_baseline(mu, genre_bias, test["genres"])
@@ -220,19 +249,22 @@ def main():
         rmse=rmse(test["rating"], base_preds_test["BaselineOnly"]),
         mape=mape(test["rating"], base_preds_test["BaselineOnly"]),
     )
+    print(f"      done in {time.time() - t0:.1f}s")
 
     # --- 2) KNNBaseline (Item), fit on train only ------------------------
-    print("[fit] KNNBaseline_Item ...")
-    knn_train = fit_knn(train["latent"])
-    base_preds_meta["KNNBaseline_Item"] = predict_knn(knn_train, train["rating"], meta["latent"])
-    base_preds_test["KNNBaseline_Item"] = predict_knn(knn_train, train["rating"], test["latent"])
+    t0 = time.time()
+    print(f"[fit] KNNBaseline_Item (reference pool capped at {KNN_REFERENCE_SIZE:,}) ...")
+    knn_train, ref_rating_train, _ref_idx_train = fit_knn(train["latent"], train["rating"])
+    base_preds_meta["KNNBaseline_Item"] = predict_knn(knn_train, ref_rating_train, meta["latent"])
+    base_preds_test["KNNBaseline_Item"] = predict_knn(knn_train, ref_rating_train, test["latent"])
     metrics["KNNBaseline_Item"] = dict(
         rmse=rmse(test["rating"], base_preds_test["KNNBaseline_Item"]),
         mape=mape(test["rating"], base_preds_test["KNNBaseline_Item"]),
     )
+    print(f"      done in {time.time() - t0:.1f}s")
 
     # --- 3) SVD (matrix factorization: linear regression on latent) -----
-    print("[fit] SVD ...")
+    print("[fit] SVD ..."); t0 = time.time()
     svd_reg = LinearRegression().fit(train["latent"], train["rating"])
     base_preds_meta["SVD"] = svd_reg.predict(meta["latent"])
     base_preds_test["SVD"] = svd_reg.predict(test["latent"])
@@ -240,9 +272,10 @@ def main():
         rmse=rmse(test["rating"], base_preds_test["SVD"]),
         mape=mape(test["rating"], base_preds_test["SVD"]),
     )
+    print(f"      done in {time.time() - t0:.1f}s")
 
     # --- 4) SVD++ (latent + implicit "votes" signal) ---------------------
-    print("[fit] SVD++ ...")
+    print("[fit] SVD++ ..."); t0 = time.time()
     svdpp_feat = lambda d: np.hstack([d["latent"], np.log1p(d["votes"]).reshape(-1, 1)])
     svdpp_reg = LinearRegression().fit(svdpp_feat(train), train["rating"])
     base_preds_meta["SVD++"] = svdpp_reg.predict(svdpp_feat(meta))
@@ -251,9 +284,10 @@ def main():
         rmse=rmse(test["rating"], base_preds_test["SVD++"]),
         mape=mape(test["rating"], base_preds_test["SVD++"]),
     )
+    print(f"      done in {time.time() - t0:.1f}s")
 
     # --- 5) XGBoost (base) ------------------------------------------------
-    print("[fit] XGBoost ...")
+    print("[fit] XGBoost ..."); t0 = time.time()
     def make_xgb():
         return XGBRegressor(
             n_estimators=200, max_depth=6, learning_rate=0.05,
@@ -267,6 +301,7 @@ def main():
         rmse=rmse(test["rating"], base_preds_test["XGBoost"]),
         mape=mape(test["rating"], base_preds_test["XGBoost"]),
     )
+    print(f"      done in {time.time() - t0:.1f}s")
 
     # --- 6-9) Combo models: XGBoost fit on META, using base models' -----
     #          out-of-sample predictions as extra features (no leakage:
@@ -283,6 +318,7 @@ def main():
     }
     combo_models = {}
     for name, keys in combos.items():
+        t0 = time.time()
         print(f"[fit] {name} ...")
         X_meta_stacked = stacked(meta["X"], base_preds_meta, keys)
         X_test_stacked = stacked(test["X"], base_preds_test, keys)
@@ -290,6 +326,7 @@ def main():
         pred_test = model.predict(X_test_stacked)
         metrics[name] = dict(rmse=rmse(test["rating"], pred_test), mape=mape(test["rating"], pred_test))
         combo_models[name] = model
+        print(f"      done in {time.time() - t0:.1f}s")
 
     print("\n[metrics] (held-out test split, lower RMSE/MAPE = more accurate)")
     for name in MODEL_NAMES:
@@ -308,11 +345,14 @@ def main():
     mu_f, genre_bias_f = fit_baseline(full_genres, full_rating, full_votes)
     base_preds_full["BaselineOnly"] = predict_baseline(mu_f, genre_bias_f, full_genres)
 
-    knn_full = fit_knn(full_latent)
-    self_idx = np.arange(n)
+    t0 = time.time()
+    print(f"      KNNBaseline_Item production predictions (reference pool capped at {KNN_REFERENCE_SIZE:,}) ...")
+    knn_full, ref_rating_full, ref_idx_full = fit_knn(full_latent, full_rating)
+    query_idx_full = np.arange(n)
     base_preds_full["KNNBaseline_Item"] = predict_knn(
-        knn_full, full_rating, full_latent, self_offset=self_idx
+        knn_full, ref_rating_full, full_latent, ref_idx=ref_idx_full, query_idx=query_idx_full
     )
+    print(f"      done in {time.time() - t0:.1f}s")
 
     svd_reg_f = LinearRegression().fit(full_latent, full_rating)
     base_preds_full["SVD"] = svd_reg_f.predict(full_latent)
